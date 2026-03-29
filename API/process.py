@@ -1,97 +1,114 @@
-
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-import pandas as pd
 import io
+import json
+import pandas as pd
+from fastapi import UploadFile, File, Form, HTTPException
+from fastapi.responses import StreamingResponse
 from typing import Optional
 
-app = FastAPI()
 
-# CORS for Vercel deployment
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.post("/api/process")
 async def process_inventory(
     file: UploadFile = File(...),
-    quantity_col: Optional[str] = "Quantity",
-    code_col: Optional[str] = "Code"
+    quantity_col: str = Form("Quantity"),
+    type_col: str = Form("Type"),
+    size_col: str = Form("Size"),
+    code_col: str = Form("Code"),
+    options: Optional[str] = Form("{}")
 ):
-    """
-    Process Excel inventory file:
-    1. Clean and validate data
-    2. Summarize by Code
-    3. Identify duplicates
-    """
     try:
-        # Read uploaded file
-        contents = await file.read()
-        df = pd.read_excel(io.BytesIO(contents))
-        
-        # Validate columns
-        if quantity_col not in df.columns or code_col not in df.columns:
-            available = list(df.columns)
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Columns not found. Available: {available}. Expected: {quantity_col}, {code_col}"
-            )
-        
-        # Data cleaning (from your Kivy app)
-        df[quantity_col] = pd.to_numeric(df[quantity_col], errors='coerce')
-        df[code_col] = df[code_col].astype(str).str.strip()
-        
-        # Remove rows with null quantities
-        df_clean = df.dropna(subset=[quantity_col]).copy()
-        
-        # Summary by Code (sum quantities)
-        summary = df_clean.groupby(code_col, as_index=False)[quantity_col].sum()
-        summary = summary.sort_values(by=quantity_col, ascending=False)
-        
-        # Find duplicates (same Code appearing multiple times)
-        duplicates = df_clean[df_clean.duplicated(subset=[code_col], keep=False)]
-        duplicates = duplicates.sort_values(by=[code_col, quantity_col])
-        
-        # Create Excel output in memory
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_clean.to_excel(writer, sheet_name="Cleaned Data", index=False)
-            summary.to_excel(writer, sheet_name="Summary by Code", index=False)
-            duplicates.to_excel(writer, sheet_name="Duplicates", index=False)
-            
-            # Add formatting info sheet
-            info_data = {
-                'Metric': ['Total Rows (Original)', 'Valid Rows', 'Unique Codes', 'Duplicate Codes', 'Total Quantity'],
-                'Value': [
-                    len(df),
-                    len(df_clean),
-                    df_clean[code_col].nunique(),
-                    len(duplicates[code_col].unique()) if not duplicates.empty else 0,
-                    df_clean[quantity_col].sum()
-                ]
-            }
-            pd.DataFrame(info_data).to_excel(writer, sheet_name="Summary Stats", index=False)
-        
-        output.seek(0)
-        
-        # Return as downloadable file
-        filename = file.filename.replace('.xlsx', '_Processed.xlsx').replace('.xls', '_Processed.xlsx')
-        
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": f"attachment; filename={filename}"}
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        options_dict = json.loads(options)
+    except:
+        options_dict = {
+            'skipDuplicateHeaders': True,
+            'validateCodePattern': True,
+            'autoCleanTypes': True
+        }
 
-# Health check
-@app.get("/api/health")
-async def health():
-    return {"status": "ok", "service": "inventory-processor"}
+    config = {
+        'quantity_col': quantity_col,
+        'type_col': type_col,
+        'size_col': size_col,
+        'code_col': code_col,
+    }
+
+    file_content = await file.read()
+
+    try:
+        result = _process_excel(file_content, config, options_dict)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n{traceback.format_exc()}")
+
+    stats_header = json.dumps(result['stats'])
+
+    return StreamingResponse(
+        io.BytesIO(result['output']),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": 'attachment; filename="processed_inventory.xlsx"',
+            "X-Processing-Stats": stats_header,
+        }
+    )
+
+
+def _process_excel(file_content, config, options):
+    df = pd.read_excel(io.BytesIO(file_content))
+
+    if options.get('skipDuplicateHeaders', True) and len(df) > 0:
+        second_row = df.iloc[0].astype(str).tolist()
+        headers = [str(col).strip() for col in df.columns]
+        if all(h == v.strip() for h, v in zip(headers, second_row)):
+            df = df.iloc[1:].reset_index(drop=True)
+
+    df.columns = [str(col).strip() for col in df.columns]
+
+    col_map = {}
+    for src, dst in [
+        (config['quantity_col'], 'Quantity'),
+        (config['type_col'], 'Type'),
+        (config['size_col'], 'Size'),
+        (config['code_col'], 'Code'),
+    ]:
+        if src in df.columns:
+            col_map[src] = dst
+
+    df = df.rename(columns=col_map)
+
+    for col in ['Quantity', 'Type', 'Size', 'Code']:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
+
+    df['Quantity'] = pd.to_numeric(df['Quantity'], errors='coerce').fillna(0)
+    df['Type'] = df['Type'].astype(str).str.strip().str.upper() if options.get('autoCleanTypes', True) else df['Type'].astype(str).str.strip()
+    df['Size'] = df['Size'].astype(str).str.strip()
+    df['Code'] = df['Code'].astype(str).str.strip().str.upper()
+
+    df = df[~df['Code'].isin(['NAN', '', 'CODE'])]
+
+    validation_errors = []
+    if options.get('validateCodePattern', True):
+        for idx, row in df.iterrows():
+            expected = f"{row['Type']}-{row['Size']}"
+            if row['Code'] != expected:
+                validation_errors.append(f"Row {idx + 1}: Code '{row['Code']}' should be '{expected}'")
+
+    stats = {
+        'total_rows': len(df),
+        'unique_codes': df['Code'].nunique(),
+        'total_quantity': int(df['Quantity'].sum()),
+        'validation_warnings': len(validation_errors)
+    }
+
+    summary = df.groupby(['Type', 'Size', 'Code'], as_index=False).agg({'Quantity': 'sum'}).sort_values(['Type', 'Size', 'Code']) if len(df) > 0 else pd.DataFrame(columns=['Type', 'Size', 'Code', 'Quantity'])
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        summary.to_excel(writer, sheet_name='Summary', index=False)
+        df.to_excel(writer, sheet_name='Cleaned Data', index=False)
+        if validation_errors:
+            pd.DataFrame({'Validation Errors': validation_errors}).to_excel(writer, sheet_name='Validation Errors', index=False)
+        df[['Quantity', 'Type', 'Size', 'Code']].to_excel(writer, sheet_name='Reimport Ready', index=False)
+
+    output.seek(0)
+    return {'output': output.getvalue(), 'stats': stats}

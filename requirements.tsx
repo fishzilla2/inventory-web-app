@@ -1,5 +1,3 @@
-fastapi==0.104.1
-pandas==2.0.3
+pandas==2.1.4
 openpyxl==3.1.2
-python-multipart==0.0.6
-uvicorn==0.24.0
+xlrd==2.0.1
